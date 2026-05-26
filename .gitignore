@@ -15,10 +15,12 @@ uv.lock
 # ML artifacts (often large, often re-derivable)
 checkpoints/
 exports/
-data/raw/
-data/processed/
+data/
 runs/
 wandb/
+
+# Training data — user-collected face images stay on local disk only
+# (never push, includes data/clicks/, data/raw/, data/processed/, etc.)
 *.ckpt
 *.pt
 *.pth

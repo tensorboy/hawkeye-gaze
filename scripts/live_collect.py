@@ -242,14 +242,25 @@ class FrameBuffer:
 
 
 class ClickCollector:
-    def __init__(self, out_dir: Path, buffer: FrameBuffer) -> None:
+    def __init__(
+        self,
+        out_dir: Path,
+        buffer: FrameBuffer,
+        grid_size: int = 10,
+        max_per_zone: int = 50,
+    ) -> None:
         self.out_dir = out_dir
         self.frames_dir = out_dir / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = out_dir / "clicks.csv"
         self.buffer = buffer
         self.count = 0
+        self.rejected = 0
         self.screen_w, self.screen_h = get_primary_screen_size()
+        self.grid_size = grid_size
+        self.max_per_zone = max_per_zone
+        # zone (gx, gy) → count; persists across runs by re-scanning CSV at startup
+        self.zone_counts: dict[tuple[int, int], int] = {}
 
         # Write CSV header once
         if not self.csv_path.exists():
@@ -257,11 +268,30 @@ class ClickCollector:
                 w = csv.writer(f)
                 w.writerow(["image_path", "click_x", "click_y", "screen_w", "screen_h", "timestamp_iso"])
         else:
-            # Count existing rows for resume
+            # Count existing rows for resume + tally zones
             with self.csv_path.open() as f:
-                self.count = sum(1 for _ in f) - 1
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self.count += 1
+                    try:
+                        z = self._zone_for(
+                            float(row["click_x"]), float(row["click_y"]),
+                            int(row["screen_w"]), int(row["screen_h"]),
+                        )
+                        self.zone_counts[z] = self.zone_counts.get(z, 0) + 1
+                    except (KeyError, ValueError):
+                        continue
         print(f"[collect] output dir: {self.out_dir} (existing: {self.count} samples)")
         print(f"[collect] primary screen: {self.screen_w}×{self.screen_h}")
+        print(f"[collect] balance: {grid_size}×{grid_size} grid, max {max_per_zone} samples/zone")
+        full_zones = sum(1 for c in self.zone_counts.values() if c >= max_per_zone)
+        if full_zones:
+            print(f"[collect] {full_zones} / {grid_size * grid_size} zones already at cap — new clicks there will be rejected")
+
+    def _zone_for(self, x: float, y: float, sw: int, sh: int) -> tuple[int, int]:
+        gx = min(self.grid_size - 1, max(0, int(x / sw * self.grid_size)))
+        gy = min(self.grid_size - 1, max(0, int(y / sh * self.grid_size)))
+        return gx, gy
 
     def on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
         # Only on press (not release) and only left button
@@ -269,6 +299,13 @@ class ClickCollector:
             return
         frame, ts = self.buffer.latest()
         if frame is None:
+            return
+
+        zone = self._zone_for(x, y, self.screen_w, self.screen_h)
+        zcount = self.zone_counts.get(zone, 0)
+        if zcount >= self.max_per_zone:
+            self.rejected += 1
+            print(f"[collect]   skip ({x:>5},{y:>5}) — zone {zone} already at {zcount}/{self.max_per_zone}  (rejected total: {self.rejected})")
             return
 
         now = datetime.fromtimestamp(ts, tz=timezone.utc)
@@ -281,7 +318,8 @@ class ClickCollector:
             w.writerow([str(img_path.relative_to(self.out_dir)), x, y, self.screen_w, self.screen_h, now.isoformat()])
 
         self.count += 1
-        print(f"[collect] {self.count:5d} ← click ({x:>5},{y:>5}) → {img_path.name}")
+        self.zone_counts[zone] = zcount + 1
+        print(f"[collect] {self.count:5d} ← click ({x:>5},{y:>5}) zone {zone} ({zcount + 1}/{self.max_per_zone}) → {img_path.name}")
 
 
 def draw_overlay(frame: np.ndarray, yaw: float | None, pitch: float | None, infer_ms: float, count: int, dev: str) -> np.ndarray:
@@ -309,6 +347,8 @@ def main() -> int:
     p.add_argument("--no-model", action="store_true", help="skip inference, collect-only mode")
     p.add_argument("--headless", action="store_true", help="no cv2 window")
     p.add_argument("--collect-only", action="store_true", help="alias for --no-model --headless")
+    p.add_argument("--grid-size", type=int, default=10, help="grid size for spatial balance")
+    p.add_argument("--max-per-zone", type=int, default=50, help="max samples per grid zone")
     args = p.parse_args()
     if args.collect_only:
         args.no_model = True
@@ -340,7 +380,12 @@ def main() -> int:
 
     # ── Shared frame buffer + click listener
     frame_buffer = FrameBuffer()
-    collector = ClickCollector(Path(args.out_dir), frame_buffer)
+    collector = ClickCollector(
+        Path(args.out_dir),
+        frame_buffer,
+        grid_size=args.grid_size,
+        max_per_zone=args.max_per_zone,
+    )
     listener = mouse.Listener(on_click=collector.on_click)
     listener.start()
     print("[live] global mouse listener started — click anywhere to log a sample")
