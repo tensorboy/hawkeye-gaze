@@ -213,23 +213,39 @@ def compose_split_view(
         scale_x = bot_w / max(screen_w, 1)
         scale_y = bot_h / max(screen_h, 1)
 
-        # Predicted gaze (red ring + yellow dot)
+        # ── Predicted gaze: bright LIME + black outline (visible on any background)
+        # BGR: (0, 255, 0) is pure green; outline first, then colored line over it.
         if yaw is not None and pitch is not None:
             px_log, py_log = yaw_pitch_to_screen_xy(yaw, pitch, screen_w, screen_h)
             px = int(px_log * scale_x)
             py = int(py_log * scale_y)
-            cv2.circle(bot, (px, py), 30, (0, 0, 255), 4)  # red ring
-            cv2.circle(bot, (px, py), 8, (0, 255, 255), -1)  # yellow inner dot
-            cv2.putText(bot, f"GAZE pred ({px_log}, {py_log})", (px + 40, py), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            # outline ring (black, thicker)
+            cv2.circle(bot, (px, py), 50, (0, 0, 0), 12)
+            cv2.circle(bot, (px, py), 50, (0, 255, 0), 6)  # bright lime ring
+            cv2.circle(bot, (px, py), 14, (0, 0, 0), -1)
+            cv2.circle(bot, (px, py), 12, (0, 255, 0), -1)  # center dot
+            # text with black shadow then green fg
+            text_g = f"GAZE pred ({px_log}, {py_log})"
+            tpos = (px + 60, py + 10)
+            cv2.putText(bot, text_g, tpos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6)
+            cv2.putText(bot, text_g, tpos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
-        # Mouse cursor (cyan crosshair + ring)
+        # ── Mouse cursor: bright MAGENTA crosshair + ring + outlines
         if mouse_xy is not None:
             mx = int(mouse_xy[0] * scale_x)
             my = int(mouse_xy[1] * scale_y)
-            cv2.circle(bot, (mx, my), 18, (255, 200, 0), 3)
-            cv2.line(bot, (mx - 28, my), (mx + 28, my), (255, 200, 0), 2)
-            cv2.line(bot, (mx, my - 28), (mx, my + 28), (255, 200, 0), 2)
-            cv2.putText(bot, f"MOUSE ({mouse_xy[0]}, {mouse_xy[1]})", (mx + 40, my + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
+            magenta = (255, 0, 255)
+            # outline (black) then magenta on top, for both ring and crosshair
+            cv2.circle(bot, (mx, my), 32, (0, 0, 0), 10)
+            cv2.circle(bot, (mx, my), 32, magenta, 5)
+            cv2.line(bot, (mx - 48, my), (mx + 48, my), (0, 0, 0), 8)
+            cv2.line(bot, (mx - 48, my), (mx + 48, my), magenta, 4)
+            cv2.line(bot, (mx, my - 48), (mx, my + 48), (0, 0, 0), 8)
+            cv2.line(bot, (mx, my - 48), (mx, my + 48), magenta, 4)
+            text_m = f"MOUSE ({mouse_xy[0]}, {mouse_xy[1]})"
+            tpos_m = (mx + 60, my + 60)
+            cv2.putText(bot, text_m, tpos_m, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6)
+            cv2.putText(bot, text_m, tpos_m, cv2.FONT_HERSHEY_SIMPLEX, 1.0, magenta, 2)
 
         cv2.putText(bot, f"SCREEN  {bot.shape[1]}x{bot.shape[0]}  (heuristic mapping until trained)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         bot_resized = cv2.resize(bot, (target_w, int(target_w * bot.shape[0] / bot.shape[1])))
