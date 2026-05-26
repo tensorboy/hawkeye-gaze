@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -190,6 +191,105 @@ class MPIIFaceGazeDataset(Dataset):
         return sample.image, sample.yaw_deg, sample.pitch_deg
 
 
+@dataclass
+class ClickRecord:
+    image_path: Path
+    click_x: float
+    click_y: float
+    screen_w: int
+    screen_h: int
+
+
+ClickTransformFn = Callable[[Image.Image, float, float, int, int], "ClickSample"]
+
+
+@dataclass
+class ClickSample:
+    image: "torch.Tensor"
+    x_norm: float  # click_x / screen_w
+    y_norm: float  # click_y / screen_h
+    screen_w: int
+    screen_h: int
+
+
+class ClickLabelDataset(Dataset):
+    """Click-as-label dataset for end-to-end screen-coord training.
+
+    Reads the CSV produced by `scripts/live_collect.py`:
+        image_path, click_x, click_y, screen_w, screen_h, timestamp_iso
+
+    Returns (face_image_tensor, x_norm, y_norm, screen_w, screen_h).
+    The label is the *normalized* click position, so the model output space
+    is device-independent. Screen dimensions are returned alongside so the
+    training loop can compute pixel-space errors for monitoring.
+    """
+
+    def __init__(
+        self,
+        label_file: str | Path,
+        image_root: str | Path | None = None,
+        transform: TransformFn | None = None,
+        hflip_prob: float = 0.5,  # gaze-aware flip — also negates x_norm
+        input_size: int = 256,
+        mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
+        std: tuple[float, float, float] = (0.5, 0.5, 0.5),
+        train: bool = True,
+    ) -> None:
+        import csv
+
+        self.label_file = Path(label_file)
+        self.image_root = Path(image_root) if image_root else self.label_file.parent
+        self.records: list[ClickRecord] = []
+        with self.label_file.open() as f:
+            reader = csv.DictReader(f)
+            required = {"image_path", "click_x", "click_y", "screen_w", "screen_h"}
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"click CSV {self.label_file} missing columns: {missing}")
+            for row in reader:
+                p = Path(row["image_path"])
+                if not p.is_absolute():
+                    p = self.image_root / p
+                self.records.append(
+                    ClickRecord(
+                        image_path=p,
+                        click_x=float(row["click_x"]),
+                        click_y=float(row["click_y"]),
+                        screen_w=int(row["screen_w"]),
+                        screen_h=int(row["screen_h"]),
+                    )
+                )
+
+        from torchvision import transforms as T
+
+        ops = [
+            T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BICUBIC),
+            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2) if train else T.Lambda(lambda x: x),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ]
+        self.transform = T.Compose(ops)
+        self.hflip_prob = hflip_prob if train else 0.0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> tuple:
+        rec = self.records[idx]
+        img = Image.open(rec.image_path).convert("RGB")
+        x_norm = rec.click_x / rec.screen_w
+        y_norm = rec.click_y / rec.screen_h
+
+        # Horizontal flip is the only safe gaze-preserving spatial aug:
+        # flip the face image AND flip x_norm around 0.5.
+        if np.random.rand() < self.hflip_prob:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            x_norm = 1.0 - x_norm
+
+        tensor = self.transform(img)
+        return tensor, float(x_norm), float(y_norm), rec.screen_w, rec.screen_h
+
+
 def build_dataset(cfg: dict, train: bool) -> Dataset:
     """Factory dispatched on cfg['type']."""
     kind = cfg["type"]
@@ -227,5 +327,15 @@ def build_dataset(cfg: dict, train: bool) -> Dataset:
             label_files=cfg["label_files_train" if train else "label_files_val"],
             image_root=cfg["image_root"],
             transform=transform,
+        )
+    if kind == "clicks":
+        return ClickLabelDataset(
+            label_file=cfg["label_file_train" if train else "label_file_val"],
+            image_root=cfg.get("image_root"),
+            hflip_prob=cfg.get("hflip_prob", 0.5),
+            input_size=cfg.get("input_size", 256),
+            mean=tuple(cfg.get("mean", (0.5, 0.5, 0.5))),
+            std=tuple(cfg.get("std", (0.5, 0.5, 0.5))),
+            train=train,
         )
     raise ValueError(f"unknown dataset type: {kind}")

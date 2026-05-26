@@ -1,0 +1,40 @@
+# End-to-end screen-coord training from click-as-label data.
+#
+# Input:  face crop (256×256)
+# Output: normalized screen (x, y) in [0, 1]²
+# Loss:   Huber on normalized coords, monitored alongside mean pixel error.
+
+backbone: siglip2_base_256
+epochs: 50
+batch_size: 8       # small dataset (~50 samples); keep batch small + lots of epochs
+num_workers: 2
+grad_clip: 1.0
+seed: 42
+amp: true
+log_interval: 5
+eval_interval: 50   # short: ~6 batches / epoch when n=50
+ckpt_dir: checkpoints
+run_name: siglip2_clicks_v1
+
+optim:
+  backbone_lr: 5.0e-6    # gentle on backbone — small dataset, easy to over-fit
+  head_lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_steps: 50
+
+# screen_coord_loss is hardcoded Huber + pixel monitor; loss weights unused
+loss:
+  huber_delta: 0.05
+
+data:
+  type: clicks
+  label_file_train: data/clicks/clicks.csv   # currently same file → random_split
+  label_file_val: data/clicks/clicks.csv
+  image_root: data/clicks
+  val_fraction: 0.15
+  input_size: 256
+  mean: [0.5, 0.5, 0.5]   # SigLIP normalization
+  std: [0.5, 0.5, 0.5]
+  hflip_prob: 0.5         # also flips x_norm around 0.5 — gaze-preserving
+
+wandb_project: null

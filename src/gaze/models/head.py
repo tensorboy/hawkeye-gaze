@@ -112,3 +112,65 @@ def angular_error_deg(pred_yaw: Tensor, pred_pitch: Tensor, tgt_yaw: Tensor, tgt
     v_tgt = to_vec(tgt_yaw, tgt_pitch)
     cos = (v_pred * v_tgt).sum(dim=-1).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
     return torch.rad2deg(torch.acos(cos))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Screen-coordinate head: directly regresses normalized (x, y) ∈ [0, 1]².
+# Used when training from (face_image, click_xy) pairs — skips the
+# yaw/pitch intermediate representation and lets the network learn the
+# camera ↔ screen geometry end-to-end.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ScreenXYOutput:
+    xy_norm: Tensor  # (B, 2) in [0, 1]^2 — normalized screen position
+
+
+class ScreenCoordHead(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 512, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, features: Tensor) -> ScreenXYOutput:
+        return ScreenXYOutput(xy_norm=self.net(features))
+
+
+def screen_coord_loss(
+    out: ScreenXYOutput,
+    xy_target_norm: Tensor,
+    huber_delta: float = 0.05,
+) -> tuple[Tensor, dict[str, float]]:
+    """Huber (smooth-L1) loss on normalized screen coords. Less click-outlier
+    sensitive than plain MSE — a single mis-clicked sample 0.5 away won't
+    blow up the gradient."""
+    diff = out.xy_norm - xy_target_norm
+    loss = nn.functional.huber_loss(out.xy_norm, xy_target_norm, delta=huber_delta)
+    l2_norm = diff.pow(2).sum(dim=-1).sqrt()  # (B,) per-sample L2 distance in [0,1] space
+    return loss, {
+        "huber": loss.item(),
+        "l2_mean": l2_norm.mean().item(),
+        "l2_p50": l2_norm.median().item(),
+    }
+
+
+def screen_pixel_error(
+    pred_xy_norm: Tensor,
+    target_xy_norm: Tensor,
+    screen_w: int,
+    screen_h: int,
+) -> Tensor:
+    """Per-sample pixel error: ||(pred - target) ⊙ (screen_w, screen_h)||₂."""
+    delta = (pred_xy_norm - target_xy_norm) * torch.tensor(
+        [screen_w, screen_h], device=pred_xy_norm.device, dtype=pred_xy_norm.dtype
+    )
+    return delta.pow(2).sum(dim=-1).sqrt()
