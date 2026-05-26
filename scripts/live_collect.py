@@ -183,10 +183,13 @@ def compose_split_view(
     infer_ms: float,
     count: int,
     dev: str,
+    mouse_xy: tuple[int, int] | None = None,
     target_w: int = 1280,
 ) -> np.ndarray:
-    """Top = webcam with overlay. Bottom = screen capture with predicted gaze dot.
-    Both resized to target_w and stacked vertically."""
+    """Top = webcam with overlay. Bottom = screen capture with predicted gaze
+    dot AND current mouse cursor position. Both resized to target_w and
+    stacked vertically. Mouse position is drawn in cyan so it's visually
+    distinct from the red/yellow gaze prediction."""
 
     # Top: webcam
     top = webcam_bgr.copy()
@@ -201,15 +204,34 @@ def compose_split_view(
     cv2.putText(top, f"WEBCAM   infer {infer_ms:.0f}ms on {dev}   samples {count}", (10, top.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
     top_resized = cv2.resize(top, (target_w, int(target_w * top.shape[0] / top.shape[1])))
 
-    # Bottom: screen capture with predicted gaze dot
+    # Bottom: screen capture with predicted gaze dot + mouse cursor marker
     if screen_bgr is not None:
         bot = screen_bgr.copy()
+        bot_h, bot_w = bot.shape[:2]
+        # Captured image may be retina-scaled (e.g. 3200×1800 for a 1600×900 logical screen).
+        # Convert logical (screen_w, screen_h) coords to capture-pixel coords.
+        scale_x = bot_w / max(screen_w, 1)
+        scale_y = bot_h / max(screen_h, 1)
+
+        # Predicted gaze (red ring + yellow dot)
         if yaw is not None and pitch is not None:
-            px, py = yaw_pitch_to_screen_xy(yaw, pitch, screen_w, screen_h)
-            cv2.circle(bot, (px, py), 30, (0, 0, 255), 4)  # outer red ring
-            cv2.circle(bot, (px, py), 8, (0, 255, 255), -1)  # inner yellow dot
-            cv2.putText(bot, f"predicted: ({px}, {py})", (px + 40, py), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(bot, f"SCREEN  {screen_bgr.shape[1]}x{screen_bgr.shape[0]}  (heuristic mapping until trained)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            px_log, py_log = yaw_pitch_to_screen_xy(yaw, pitch, screen_w, screen_h)
+            px = int(px_log * scale_x)
+            py = int(py_log * scale_y)
+            cv2.circle(bot, (px, py), 30, (0, 0, 255), 4)  # red ring
+            cv2.circle(bot, (px, py), 8, (0, 255, 255), -1)  # yellow inner dot
+            cv2.putText(bot, f"GAZE pred ({px_log}, {py_log})", (px + 40, py), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        # Mouse cursor (cyan crosshair + ring)
+        if mouse_xy is not None:
+            mx = int(mouse_xy[0] * scale_x)
+            my = int(mouse_xy[1] * scale_y)
+            cv2.circle(bot, (mx, my), 18, (255, 200, 0), 3)
+            cv2.line(bot, (mx - 28, my), (mx + 28, my), (255, 200, 0), 2)
+            cv2.line(bot, (mx, my - 28), (mx, my + 28), (255, 200, 0), 2)
+            cv2.putText(bot, f"MOUSE ({mouse_xy[0]}, {mouse_xy[1]})", (mx + 40, my + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
+
+        cv2.putText(bot, f"SCREEN  {bot.shape[1]}x{bot.shape[0]}  (heuristic mapping until trained)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         bot_resized = cv2.resize(bot, (target_w, int(target_w * bot.shape[0] / bot.shape[1])))
     else:
         bot_resized = np.zeros((target_w * 9 // 16, target_w, 3), dtype=np.uint8)
@@ -388,6 +410,7 @@ def main() -> int:
     )
     listener = mouse.Listener(on_click=collector.on_click)
     listener.start()
+    mouse_ctrl = mouse.Controller()  # for per-frame cursor position query
     print("[live] global mouse listener started — click anywhere to log a sample")
     print("[live] (macOS: grant Accessibility permission to your terminal app if prompted)")
 
@@ -433,6 +456,11 @@ def main() -> int:
                     screen_bgr = grab_screen_below_window_bgr(cv2_window_id)
                     last_screen_grab_ts = now
 
+                try:
+                    mx, my = mouse_ctrl.position
+                    mouse_xy = (int(mx), int(my))
+                except Exception:
+                    mouse_xy = None
                 composite = compose_split_view(
                     webcam_bgr=frame,
                     screen_bgr=screen_bgr,
@@ -443,6 +471,7 @@ def main() -> int:
                     infer_ms=last_infer_ms,
                     count=collector.count,
                     dev=str(device),
+                    mouse_xy=mouse_xy,
                 )
                 cv2.imshow(WINDOW_NAME, composite)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
