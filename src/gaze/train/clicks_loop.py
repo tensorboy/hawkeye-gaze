@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler, random_split
 from tqdm import tqdm
 
 from gaze.data.dataset import build_dataset
@@ -86,6 +86,38 @@ def split_dataset(ds: torch.utils.data.Dataset, val_fraction: float = 0.15, seed
     return train_ds, val_ds
 
 
+def compute_stratified_weights(
+    train_subset: torch.utils.data.Subset,
+    grid_size: int = 10,
+) -> torch.Tensor:
+    """Inverse-density weights for WeightedRandomSampler.
+
+    Walks the training subset's underlying ClickRecord list to find each
+    sample's (x_norm, y_norm) → grid zone, counts zone populations, and
+    assigns weight = 1 / count[zone] to each sample. Samples in rare zones
+    get sampled more often per epoch, balancing the batch composition
+    without throwing data away.
+    """
+    base = train_subset.dataset  # ClickLabelDataset
+    indices = list(train_subset.indices)
+    zones: list[tuple[int, int]] = []
+    for idx in indices:
+        rec = base.records[idx]
+        gx = min(grid_size - 1, max(0, int(rec.click_x / rec.screen_w * grid_size)))
+        gy = min(grid_size - 1, max(0, int(rec.click_y / rec.screen_h * grid_size)))
+        zones.append((gx, gy))
+    counts: dict[tuple[int, int], int] = {}
+    for z in zones:
+        counts[z] = counts.get(z, 0) + 1
+    weights = torch.tensor([1.0 / counts[z] for z in zones], dtype=torch.double)
+    # Normalize so the mean weight is 1 (cosmetic; sampler only cares about ratios)
+    weights = weights * (len(weights) / weights.sum())
+    n_unique = len(counts)
+    print(f"[stratified] {len(weights)} train samples across {n_unique} occupied zones (of {grid_size**2})")
+    print(f"[stratified] weight range [{weights.min():.3f}, {weights.max():.3f}], ratio {weights.max() / weights.min():.1f}×")
+    return weights
+
+
 def train_clicks(cfg: TrainConfig) -> Path:
     set_seed(cfg.seed)
     device = pick_device()
@@ -97,10 +129,20 @@ def train_clicks(cfg: TrainConfig) -> Path:
     train_ds, val_ds = split_dataset(full_ds, val_fraction=cfg.data.get("val_fraction", 0.15), seed=cfg.seed)
     print(f"[train-clicks] train={len(train_ds)} val={len(val_ds)}")
 
+    # Stratified sampler if enabled (default): each batch becomes spatially balanced
+    use_strat = cfg.data.get("stratified_sampling", True)
+    sampler = None
+    shuffle = True
+    if use_strat:
+        weights = compute_stratified_weights(train_ds, grid_size=cfg.data.get("grid_size", 10))
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        shuffle = False  # mutually exclusive with sampler in DataLoader
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=cfg.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=collate,
