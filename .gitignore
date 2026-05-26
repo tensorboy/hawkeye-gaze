@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# uv
+uv.lock
+
+# ML artifacts (often large, often re-derivable)
+checkpoints/
+exports/
+data/raw/
+data/processed/
+runs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.mlpackage
+*.mlmodel
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
