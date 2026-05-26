@@ -93,6 +93,52 @@ def grab_screen_bgr() -> np.ndarray | None:
         return None
 
 
+# Fixed cv2 window position (logical points). The capture mask uses this to
+# blank out the on-screen demo window itself — otherwise we get the infinite
+# "window shows screen which shows window which shows screen" recursion.
+WINDOW_LOGICAL_X = 20
+WINDOW_LOGICAL_Y = 20
+
+
+def mask_demo_window(
+    screen_bgr: np.ndarray,
+    composite_px_w: int,
+    composite_px_h: int,
+    screen_logical_w: int,
+    screen_logical_h: int,
+) -> np.ndarray:
+    """Black out the rectangle in the screen capture where the cv2 demo window
+    actually sits. Without this, capturing the screen captures the demo window
+    too, producing recursive infinite-mirror display."""
+    cap_h, cap_w = screen_bgr.shape[:2]
+    # cv2.imshow uses pixels 1:1, so window logical size = composite_px / backing_scale.
+    scale_x = cap_w / max(screen_logical_w, 1)
+    scale_y = cap_h / max(screen_logical_h, 1)
+    backing = scale_x  # primary display backing scale (≈1 or ≈2 retina)
+    win_logical_w = composite_px_w / max(backing, 1.0)
+    win_logical_h = composite_px_h / max(backing, 1.0)
+
+    x0 = int(WINDOW_LOGICAL_X * scale_x)
+    y0 = int(WINDOW_LOGICAL_Y * scale_y)
+    x1 = int((WINDOW_LOGICAL_X + win_logical_w) * scale_x)
+    y1 = int((WINDOW_LOGICAL_Y + win_logical_h) * scale_y)
+    x1 = min(x1, cap_w)
+    y1 = min(y1, cap_h)
+
+    masked = screen_bgr.copy()
+    cv2.rectangle(masked, (x0, y0), (x1, y1), (28, 28, 28), -1)
+    cv2.putText(
+        masked,
+        "← live demo window masked out",
+        (x0 + 24, max(y0 + 60, 60)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (160, 160, 160),
+        2,
+    )
+    return masked
+
+
 def yaw_pitch_to_screen_xy(
     yaw_deg: float, pitch_deg: float, screen_w: int, screen_h: int
 ) -> tuple[int, int]:
@@ -285,9 +331,17 @@ def main() -> int:
 
     last_infer_ms = 0.0
     yaw = pitch = None
-    screen_bgr: np.ndarray | None = None
+    raw_screen_bgr: np.ndarray | None = None
     last_screen_grab_ts = 0.0
     SCREEN_GRAB_INTERVAL = 0.25  # 4 fps screen refresh — keeps CPU sane
+
+    WINDOW_NAME = "hawkeye-gaze live + collect"
+    composite_h_cached = 0  # filled in after first compose
+    composite_w_cached = 0
+
+    if not args.headless:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.moveWindow(WINDOW_NAME, WINDOW_LOGICAL_X, WINDOW_LOGICAL_Y)
 
     try:
         while True:
@@ -312,12 +366,24 @@ def main() -> int:
                 # Refresh screen capture at SCREEN_GRAB_INTERVAL
                 now = time.time()
                 if now - last_screen_grab_ts > SCREEN_GRAB_INTERVAL:
-                    screen_bgr = grab_screen_bgr()
+                    raw_screen_bgr = grab_screen_bgr()
                     last_screen_grab_ts = now
+
+                # Mask the demo window region out of the screen capture so the
+                # composite shows what the screen would look like without us.
+                screen_for_display = raw_screen_bgr
+                if raw_screen_bgr is not None and composite_w_cached > 0:
+                    screen_for_display = mask_demo_window(
+                        raw_screen_bgr,
+                        composite_px_w=composite_w_cached,
+                        composite_px_h=composite_h_cached,
+                        screen_logical_w=collector.screen_w,
+                        screen_logical_h=collector.screen_h,
+                    )
 
                 composite = compose_split_view(
                     webcam_bgr=frame,
-                    screen_bgr=screen_bgr,
+                    screen_bgr=screen_for_display,
                     yaw=yaw,
                     pitch=pitch,
                     screen_w=collector.screen_w,
@@ -326,7 +392,8 @@ def main() -> int:
                     count=collector.count,
                     dev=str(device),
                 )
-                cv2.imshow("hawkeye-gaze live + collect", composite)
+                composite_h_cached, composite_w_cached = composite.shape[:2]
+                cv2.imshow(WINDOW_NAME, composite)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             else:
