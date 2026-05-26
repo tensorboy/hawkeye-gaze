@@ -81,62 +81,79 @@ def get_primary_screen_size() -> tuple[int, int]:
         return 1920, 1080  # fallback
 
 
-def grab_screen_bgr() -> np.ndarray | None:
-    """Full primary-screen screenshot as a BGR numpy array. Returns None on failure."""
+def _find_cv2_window_id(title: str) -> int | None:
+    """Look up our cv2 window's CGWindowID by its visible title."""
     try:
-        from PIL import ImageGrab
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGNullWindowID,
+            kCGWindowListOptionOnScreenOnly,
+        )
 
-        img = ImageGrab.grab(all_screens=False)
-        return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+        infos = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+        for w in infos:
+            name = w.get("kCGWindowName", "") or ""
+            if title in name:
+                return int(w["kCGWindowNumber"])
     except Exception as e:
-        print(f"[screen] capture failed: {e}", file=sys.stderr)
-        return None
+        print(f"[screen] window lookup failed: {e}", file=sys.stderr)
+    return None
 
 
-# Fixed cv2 window position (logical points). The capture mask uses this to
-# blank out the on-screen demo window itself — otherwise we get the infinite
-# "window shows screen which shows window which shows screen" recursion.
-WINDOW_LOGICAL_X = 20
-WINDOW_LOGICAL_Y = 20
+def grab_screen_below_window_bgr(window_id: int | None) -> np.ndarray | None:
+    """Capture the primary screen *excluding* the given window (and the windows
+    above it). Uses Quartz's native `kCGWindowListOptionOnScreenBelowWindow`,
+    so the demo window can be moved/resized freely without breaking the view.
+    Falls back to a full PIL.ImageGrab when the window id is unknown.
+    """
+    if window_id is None:
+        try:
+            from PIL import ImageGrab
 
+            img = ImageGrab.grab(all_screens=False)
+            return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"[screen] PIL fallback failed: {e}", file=sys.stderr)
+            return None
 
-def mask_demo_window(
-    screen_bgr: np.ndarray,
-    composite_px_w: int,
-    composite_px_h: int,
-    screen_logical_w: int,
-    screen_logical_h: int,
-) -> np.ndarray:
-    """Black out the rectangle in the screen capture where the cv2 demo window
-    actually sits. Without this, capturing the screen captures the demo window
-    too, producing recursive infinite-mirror display."""
-    cap_h, cap_w = screen_bgr.shape[:2]
-    # cv2.imshow uses pixels 1:1, so window logical size = composite_px / backing_scale.
-    scale_x = cap_w / max(screen_logical_w, 1)
-    scale_y = cap_h / max(screen_logical_h, 1)
-    backing = scale_x  # primary display backing scale (≈1 or ≈2 retina)
-    win_logical_w = composite_px_w / max(backing, 1.0)
-    win_logical_h = composite_px_h / max(backing, 1.0)
+    try:
+        from Quartz import (
+            CGDataProviderCopyData,
+            CGImageGetBytesPerRow,
+            CGImageGetDataProvider,
+            CGImageGetHeight,
+            CGImageGetWidth,
+            CGRectInfinite,
+            CGWindowListCreateImage,
+            kCGWindowImageDefault,
+            kCGWindowListOptionOnScreenBelowWindow,
+        )
 
-    x0 = int(WINDOW_LOGICAL_X * scale_x)
-    y0 = int(WINDOW_LOGICAL_Y * scale_y)
-    x1 = int((WINDOW_LOGICAL_X + win_logical_w) * scale_x)
-    y1 = int((WINDOW_LOGICAL_Y + win_logical_h) * scale_y)
-    x1 = min(x1, cap_w)
-    y1 = min(y1, cap_h)
+        img_ref = CGWindowListCreateImage(
+            CGRectInfinite,
+            kCGWindowListOptionOnScreenBelowWindow,
+            window_id,
+            kCGWindowImageDefault,
+        )
+        if img_ref is None:
+            return None
+        w = CGImageGetWidth(img_ref)
+        h = CGImageGetHeight(img_ref)
+        bpr = CGImageGetBytesPerRow(img_ref)
+        data = CGDataProviderCopyData(CGImageGetDataProvider(img_ref))
+        buf = bytes(data)
+        arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, bpr // 4, 4))[:, :w, :]
+        # macOS captures as BGRA → drop alpha
+        return arr[:, :, :3].copy()
+    except Exception as e:
+        print(f"[screen] CGWindowListCreateImage failed: {e}", file=sys.stderr)
+        try:
+            from PIL import ImageGrab
 
-    masked = screen_bgr.copy()
-    cv2.rectangle(masked, (x0, y0), (x1, y1), (28, 28, 28), -1)
-    cv2.putText(
-        masked,
-        "← live demo window masked out",
-        (x0 + 24, max(y0 + 60, 60)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (160, 160, 160),
-        2,
-    )
-    return masked
+            img = ImageGrab.grab(all_screens=False)
+            return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            return None
 
 
 def yaw_pitch_to_screen_xy(
@@ -331,17 +348,15 @@ def main() -> int:
 
     last_infer_ms = 0.0
     yaw = pitch = None
-    raw_screen_bgr: np.ndarray | None = None
+    screen_bgr: np.ndarray | None = None
     last_screen_grab_ts = 0.0
     SCREEN_GRAB_INTERVAL = 0.25  # 4 fps screen refresh — keeps CPU sane
 
     WINDOW_NAME = "hawkeye-gaze live + collect"
-    composite_h_cached = 0  # filled in after first compose
-    composite_w_cached = 0
+    cv2_window_id: int | None = None  # discovered after first imshow
 
     if not args.headless:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.moveWindow(WINDOW_NAME, WINDOW_LOGICAL_X, WINDOW_LOGICAL_Y)
 
     try:
         while True:
@@ -363,27 +378,19 @@ def main() -> int:
                 pitch = float(out.pitch_deg.item())
 
             if not args.headless:
-                # Refresh screen capture at SCREEN_GRAB_INTERVAL
+                # Refresh screen capture at SCREEN_GRAB_INTERVAL.
+                # The Quartz native API gets only the area BELOW our window,
+                # so wherever the user drags the window, recursion is impossible.
                 now = time.time()
                 if now - last_screen_grab_ts > SCREEN_GRAB_INTERVAL:
-                    raw_screen_bgr = grab_screen_bgr()
+                    if cv2_window_id is None:
+                        cv2_window_id = _find_cv2_window_id(WINDOW_NAME)
+                    screen_bgr = grab_screen_below_window_bgr(cv2_window_id)
                     last_screen_grab_ts = now
-
-                # Mask the demo window region out of the screen capture so the
-                # composite shows what the screen would look like without us.
-                screen_for_display = raw_screen_bgr
-                if raw_screen_bgr is not None and composite_w_cached > 0:
-                    screen_for_display = mask_demo_window(
-                        raw_screen_bgr,
-                        composite_px_w=composite_w_cached,
-                        composite_px_h=composite_h_cached,
-                        screen_logical_w=collector.screen_w,
-                        screen_logical_h=collector.screen_h,
-                    )
 
                 composite = compose_split_view(
                     webcam_bgr=frame,
-                    screen_bgr=screen_for_display,
+                    screen_bgr=screen_bgr,
                     yaw=yaw,
                     pitch=pitch,
                     screen_w=collector.screen_w,
@@ -392,7 +399,6 @@ def main() -> int:
                     count=collector.count,
                     dev=str(device),
                 )
-                composite_h_cached, composite_w_cached = composite.shape[:2]
                 cv2.imshow(WINDOW_NAME, composite)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
