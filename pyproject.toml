@@ -17,6 +17,7 @@ dependencies = [
     "wandb>=0.18",
     "scikit-learn>=1.5",
     "matplotlib>=3.9",
+    "pynput>=1.8.2",
 ]
 
 [project.optional-dependencies]
