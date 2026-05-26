@@ -1,0 +1,39 @@
+# Main config: SigLIP 2 Base backbone + L2CS head
+# Edit `data.*` paths to point at your dataset before running.
+
+backbone: siglip2_base_256
+epochs: 30
+batch_size: 32
+num_workers: 4
+grad_clip: 1.0
+seed: 42
+amp: true
+log_interval: 50
+eval_interval: 500
+ckpt_dir: checkpoints
+run_name: siglip2_base_gaze360
+
+optim:
+  backbone_lr: 1.0e-5
+  head_lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+
+loss:
+  ce_weight: 1.0
+  mse_weight: 1.0
+
+# Default dataset: Gaze360 official splits
+# Point this at your local Gaze360 download — see https://gaze360.csail.mit.edu/
+data:
+  type: gaze360
+  image_root: /path/to/gaze360/imgs
+  split_train: /path/to/gaze360/train.txt
+  split_val: /path/to/gaze360/validation.txt
+  input_size: 256
+  mean: [0.5, 0.5, 0.5]   # SigLIP normalization
+  std: [0.5, 0.5, 0.5]
+  hflip_prob: 0.5
+  color_jitter: 0.2
+
+wandb_project: null  # set e.g. "hawkeye-gaze" to enable wandb
