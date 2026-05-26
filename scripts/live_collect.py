@@ -280,6 +280,18 @@ class FrameBuffer:
 
 
 class ClickCollector:
+    """FIFO-per-zone collector.
+
+    Each grid zone is a fixed-capacity deque. When a new click arrives in a
+    full zone, the oldest sample in that zone is evicted (jpeg deleted,
+    CSV row removed) before the new sample is appended. This keeps the
+    training set bounded above (grid_size² × max_per_zone) while letting
+    appearance drift (new glasses, new lighting, new haircut) replace stale
+    samples organically.
+    """
+
+    CSV_FIELDS = ["image_path", "click_x", "click_y", "screen_w", "screen_h", "timestamp_iso"]
+
     def __init__(
         self,
         out_dir: Path,
@@ -287,51 +299,65 @@ class ClickCollector:
         grid_size: int = 10,
         max_per_zone: int = 50,
     ) -> None:
+        from collections import deque
+
         self.out_dir = out_dir
         self.frames_dir = out_dir / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = out_dir / "clicks.csv"
         self.buffer = buffer
-        self.count = 0
-        self.rejected = 0
         self.screen_w, self.screen_h = get_primary_screen_size()
         self.grid_size = grid_size
         self.max_per_zone = max_per_zone
-        # zone (gx, gy) → count; persists across runs by re-scanning CSV at startup
-        self.zone_counts: dict[tuple[int, int], int] = {}
+        self.evicted = 0
+        # zone → deque[row_dict]; FIFO order. Restored from CSV on startup.
+        self.zone_records: dict[tuple[int, int], deque] = {}
 
-        # Write CSV header once
         if not self.csv_path.exists():
             with self.csv_path.open("w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["image_path", "click_x", "click_y", "screen_w", "screen_h", "timestamp_iso"])
+                w = csv.DictWriter(f, fieldnames=self.CSV_FIELDS)
+                w.writeheader()
         else:
-            # Count existing rows for resume + tally zones
             with self.csv_path.open() as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    self.count += 1
                     try:
                         z = self._zone_for(
                             float(row["click_x"]), float(row["click_y"]),
                             int(row["screen_w"]), int(row["screen_h"]),
                         )
-                        self.zone_counts[z] = self.zone_counts.get(z, 0) + 1
                     except (KeyError, ValueError):
                         continue
+                    self.zone_records.setdefault(z, deque()).append(row)
+
         print(f"[collect] output dir: {self.out_dir} (existing: {self.count} samples)")
         print(f"[collect] primary screen: {self.screen_w}×{self.screen_h}")
-        print(f"[collect] balance: {grid_size}×{grid_size} grid, max {max_per_zone} samples/zone")
-        full_zones = sum(1 for c in self.zone_counts.values() if c >= max_per_zone)
+        print(f"[collect] FIFO: {grid_size}×{grid_size} grid, max {max_per_zone} samples/zone")
+        full_zones = sum(1 for d in self.zone_records.values() if len(d) >= max_per_zone)
         if full_zones:
-            print(f"[collect] {full_zones} / {grid_size * grid_size} zones already at cap — new clicks there will be rejected")
+            print(f"[collect] {full_zones} / {grid_size * grid_size} zones at cap — new clicks evict oldest in those zones")
+
+    @property
+    def count(self) -> int:
+        return sum(len(d) for d in self.zone_records.values())
 
     def _zone_for(self, x: float, y: float, sw: int, sh: int) -> tuple[int, int]:
         gx = min(self.grid_size - 1, max(0, int(x / sw * self.grid_size)))
         gy = min(self.grid_size - 1, max(0, int(y / sh * self.grid_size)))
         return gx, gy
 
+    def _rewrite_csv(self) -> None:
+        # Order rows by timestamp so the on-disk CSV stays chronologically sorted
+        all_rows = [r for d in self.zone_records.values() for r in d]
+        all_rows.sort(key=lambda r: r.get("timestamp_iso", ""))
+        with self.csv_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=self.CSV_FIELDS)
+            w.writeheader()
+            w.writerows(all_rows)
+
     def on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
+        from collections import deque
+
         # Only on press (not release) and only left button
         if not pressed or button != mouse.Button.left:
             return
@@ -340,24 +366,39 @@ class ClickCollector:
             return
 
         zone = self._zone_for(x, y, self.screen_w, self.screen_h)
-        zcount = self.zone_counts.get(zone, 0)
-        if zcount >= self.max_per_zone:
-            self.rejected += 1
-            print(f"[collect]   skip ({x:>5},{y:>5}) — zone {zone} already at {zcount}/{self.max_per_zone}  (rejected total: {self.rejected})")
-            return
+        zone_deque = self.zone_records.setdefault(zone, deque())
+
+        action = "add"
+        if len(zone_deque) >= self.max_per_zone:
+            oldest = zone_deque.popleft()
+            oldest_path = self.out_dir / oldest["image_path"]
+            if oldest_path.exists():
+                try:
+                    oldest_path.unlink()
+                except OSError as e:
+                    print(f"[collect]   warn: failed to delete {oldest_path}: {e}", file=sys.stderr)
+            self.evicted += 1
+            action = f"FIFO evict {Path(oldest['image_path']).name}"
 
         now = datetime.fromtimestamp(ts, tz=timezone.utc)
         stem = now.strftime("%Y%m%dT%H%M%S_") + f"{int((ts % 1) * 1000):03d}"
         img_path = self.frames_dir / f"{stem}.jpg"
         cv2.imwrite(str(img_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-        with self.csv_path.open("a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([str(img_path.relative_to(self.out_dir)), x, y, self.screen_w, self.screen_h, now.isoformat()])
+        row = {
+            "image_path": str(img_path.relative_to(self.out_dir)),
+            "click_x": str(x),
+            "click_y": str(y),
+            "screen_w": str(self.screen_w),
+            "screen_h": str(self.screen_h),
+            "timestamp_iso": now.isoformat(),
+        }
+        zone_deque.append(row)
+        self._rewrite_csv()
 
-        self.count += 1
-        self.zone_counts[zone] = zcount + 1
-        print(f"[collect] {self.count:5d} ← click ({x:>5},{y:>5}) zone {zone} ({zcount + 1}/{self.max_per_zone}) → {img_path.name}")
+        n_total = self.count
+        n_zone = len(zone_deque)
+        print(f"[collect] {n_total:5d} ← click ({x:>5},{y:>5}) zone {zone} ({n_zone}/{self.max_per_zone}) {action}")
 
 
 def draw_overlay(frame: np.ndarray, yaw: float | None, pitch: float | None, infer_ms: float, count: int, dev: str) -> np.ndarray:
